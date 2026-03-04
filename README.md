@@ -71,7 +71,7 @@ See argument parser for details if you want to specify the DINOv3 backbone size.
 
 ## Pretrained weights
 
-Weights for L+GNet trained on different datasets (GDD, GSD, Trans10k-stuff, HSO, all four training sets combined) are available behind the following link: [weights folder](https://google.com) *NOT WORKING YET
+Weights for L+GNet trained on different datasets (GDD, GSD, Trans10k-stuff, HSO, all four training sets combined) are available behind the following link: [weights folder](https://drive.google.com/drive/folders/1iO5MQG3m68Sqq4bVOWiu158pIfXLdyDx?usp=sharing)
 
 Prefix in the filename defines the dataset on which the model has been trained on.
 
