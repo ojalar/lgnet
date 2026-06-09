@@ -61,7 +61,7 @@ See the argument parser for full list of flags that can be provided.
 
 A minimal example on how to run inference on a single image has been provided in infer.py.
 
-To run the inference with L+GNet:
+To run inference with L+GNet:
 
 `python infer.py --image-path <path to an image> --weights-path <path to stored weights> --output-folder <path to output folder>`
 
