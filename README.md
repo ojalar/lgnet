@@ -1,7 +1,7 @@
 # Glass Segmentation with Fusion of Learned and General Visual Features (L+GNet)
 [![arXiv](https://img.shields.io/badge/arXiv-2603.03718-b31b1b.svg)](https://arxiv.org/abs/2603.03718)
 
-Official implementation of the L+GNet model, proposed in paper Glass Segmentation with Fusion of Learned and General Visual Features.
+Official implementation of the L+GNet model, proposed in the paper Glass Segmentation with Fusion of Learned and General Visual Features.
 
 <p align="center">
     <img src="visual_materials/overview.png" width="80%">
