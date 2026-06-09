@@ -26,6 +26,7 @@ from dataclasses import dataclass
 import logging
 from torchvision.ops import SqueezeExcitation
 import numpy as np
+import timm
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,121 @@ class DinoV3WithAdapterBackbone(nn.Module):
             # Return raw feature list for integration with other backbones
             return extracted_features
 
+class MiTBackbone(nn.Module):
+    """MiT (Mix Transformer / SegFormer) backbone for the learned (l) slot in L+GNet.
+    Returns 4 feature maps at strides 4/8/16/32; exposes channel_sizes for DualBackboneAdapter.
+    """
+    def __init__(self, model_name: str):
+        super().__init__()
+        self.model = AutoModel.from_pretrained(model_name)
+        # e.g. MiT-B3: [64, 128, 320, 512]
+        self.channel_sizes = list(self.model.config.hidden_sizes)
+        self._strides = [4, 8, 16, 32]
+
+    def forward(self, x: torch.Tensor) -> BackboneOutput:
+        batch_size, _, height, width = x.shape
+        outputs = self.model(pixel_values=x, output_hidden_states=True, return_dict=True)
+        feature_maps = []
+        for hs, stride, ch in zip(outputs.hidden_states, self._strides, self.channel_sizes):
+            h_i = height // stride
+            w_i = width  // stride
+            feat = hs.reshape(batch_size, h_i, w_i, ch).permute(0, 3, 1, 2)
+            feature_maps.append(feat)
+        return BackboneOutput(feature_maps=feature_maps)
+
+class SigLIPBackbone(nn.Module):
+    """SigLIP v2 ViT-L/16 backbone for the general (g) slot in L+GNet.
+    Renormalizes from ImageNet to SigLIP stats before inference.
+    """
+    def __init__(self, model_name: str):
+        super().__init__()
+        # Keep only the vision encoder; .config.hidden_size is accessible the same way as DINOv3
+        self.model = AutoModel.from_pretrained(model_name).vision_model
+        self.layers_to_extract = [5, 11, 17, 23]  # ViT-L: 24 layers total
+
+        imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        imagenet_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        siglip_mean   = torch.tensor([0.5,   0.5,   0.5  ]).view(1, 3, 1, 1)
+        siglip_std    = torch.tensor([0.5,   0.5,   0.5  ]).view(1, 3, 1, 1)
+        self.register_buffer("renorm_scale", imagenet_std  / siglip_std)
+        self.register_buffer("renorm_shift", (imagenet_mean - siglip_mean) / siglip_std)
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        x = x * self.renorm_scale + self.renorm_shift
+
+        batch_size, _, height, width = x.shape
+        patch_size = self.model.config.patch_size
+        patch_height = height // patch_size
+        patch_width  = width  // patch_size
+
+        # Forward hooks to capture intermediate layer outputs
+        captured = {}
+        hooks = []
+        for layer_idx in self.layers_to_extract:
+            def make_hook(idx):
+                def hook(module, inp, out):
+                    captured[idx] = out[0] if isinstance(out, tuple) else out
+                return hook
+            hooks.append(
+                self.model.encoder.layers[layer_idx].register_forward_hook(make_hook(layer_idx))
+            )
+
+        self.model(pixel_values=x, return_dict=False, interpolate_pos_encoding=True)
+
+        for hook in hooks:
+            hook.remove()
+
+        return [
+            captured[idx].permute(0, 2, 1).reshape(
+                batch_size, self.model.config.hidden_size, patch_height, patch_width
+            )
+            for idx in self.layers_to_extract
+        ]
+
+class PEBackbone(nn.Module):
+    """Meta PE-Core-L14-336 backbone for the general (g) slot in L+GNet.
+    Resizes features to H//16 x W//16 to match the stride-16 assumption in DualBackboneAdapter.
+    """
+    def __init__(self, model_name: str):
+        super().__init__()
+        self.model = timm.create_model(model_name, pretrained=True, num_classes=0, dynamic_img_size=True)
+        self.layers_to_extract = [5, 11, 17, 23]  # ViT-L: 24 blocks
+
+        # Expose config.hidden_size and config.patch_size for LGBackbone compatibility
+        class _Cfg:
+            pass
+        cfg = _Cfg()
+        cfg.hidden_size = self.model.embed_dim          # 1024 for ViT-L
+        cfg.patch_size  = self.model.patch_embed.patch_size[0]  # 14
+        self.model.config = cfg
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        _, _, height, width = x.shape
+        target_h, target_w = height // 16, width // 16  # align to stride-16 grid
+
+        # 512 is not divisible by PE's patch size (14); resize to 518 = 14 * 37
+        pe_size = 518
+        x_pe = torch.nn.functional.interpolate(x, size=(pe_size, pe_size), mode='bilinear', align_corners=False)
+
+        # EVA-based PE returns (final_output, intermediates_list) — discard the final output
+        _, features = self.model.forward_intermediates(
+            x_pe,
+            indices=self.layers_to_extract,
+            return_prefix_tokens=False,
+        )
+
+        result = []
+        for feat in features:
+            if feat.ndim == 3:
+                feat = feat[:, 1:] # remove class token
+                B, N, C = feat.shape
+                H = W = int(N ** 0.5)
+                feat = feat.reshape(B, H, W, C).permute(0, 3, 1, 2)
+            if feat.shape[-2:] != (target_h, target_w):
+                feat = torch.nn.functional.interpolate(feat, size=(target_h, target_w), mode='bilinear', align_corners=False)
+            result.append(feat)
+        return result
+
 class SEChannelReduction(nn.Module):
     """Channel reduction module with Squeeze-Excitation attention for feature refinement.
     Projects input channels to output channels using convolution with SE attention and residual connection.
@@ -143,15 +259,19 @@ class DualBackboneAdapter(nn.Module):
     """Adapter module to fuse features from learned and general backbones.
     Handles spatial resolution alignment and optionally applies Squeeze-Excitation attention for feature fusion.
     """
-    def __init__(self, out_channels: List[int], out_strides: Dict[str, int], in_channels: int, se: bool = True):
+    def __init__(self, out_channels: List[int], out_strides: Dict[str, int], in_channels: int,
+                 l_channels: List[int] = None, se: bool = True):
         super().__init__()
         self.out_channels = out_channels
         self.out_strides = out_strides
-        # Hardcoded ViT-stride for DINOv3 (ViT-based model)
+        # defaults to out_channels when Swin is used (channels happen to match)
+        if l_channels is None:
+            l_channels = out_channels
+        # Hardcoded ViT-stride for ViT-based general backbones (DINOv3, SigLIP ViT-L/16)
         vit_stride = 16
         # Calculate resize ratios for each pyramid level relative to ViT stride
         resize_ratios = [vit_stride / stride for stride in out_strides.values()]
-        
+
         # Create resizing operations for each feature level to align spatial resolutions
         self.resizing = nn.ModuleList()
         for i, out_ch in enumerate(out_channels):
@@ -171,17 +291,19 @@ class DualBackboneAdapter(nn.Module):
                 self.resizing.append(
                     nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=int(1/resize_ratios[i]), padding=1)
                 )
-        
-        # Create projection modules: either with SE channel reduction for better feature fusion or simple 1x1 convolution
+
+        # Create projection modules: either with SE channel reduction for better feature fusion or simple 1x1 convolution.
         if se:
             # Use SE blocks for channel-aware feature fusion with attention
             self.projections = nn.ModuleList([
-                SEChannelReduction(out_ch + in_channels, out_ch) for out_ch in out_channels
-            ]) 
+                SEChannelReduction(l_ch + in_channels, out_ch)
+                for l_ch, out_ch in zip(l_channels, out_channels)
+            ])
         else:
             # Simple channel projection via 1x1 convolution
             self.projections = nn.ModuleList([
-                nn.Conv2d(in_channels + out_ch, out_ch, kernel_size=1) for out_ch in out_channels
+                nn.Conv2d(l_ch + in_channels, out_ch, kernel_size=1)
+                for l_ch, out_ch in zip(l_channels, out_channels)
             ])
         
     def forward(self, l_features: List[torch.Tensor], g_features: List[torch.Tensor]) -> List[torch.Tensor]:
@@ -214,8 +336,12 @@ class LGBackbone(nn.Module):
         # Feature pyramid strides: coarser features at higher stages
         self._out_feature_strides = {"stage_0": 4, "stage_1": 8, "stage_2": 16, "stage_3": 32}
 
+        # l_backbone's actual per-stage output channels (MiT differs from Swin; Swin matches out_channels)
+        l_channels = list(getattr(learned_backbone, 'channel_sizes', out_channels))
         # Adapter for fusing learned and general backbone outputs
-        self.adapter = DualBackboneAdapter(out_channels, self._out_feature_strides, self.g_backbone.model.config.hidden_size, se=se)
+        self.adapter = DualBackboneAdapter(out_channels, self._out_feature_strides,
+                                           self.g_backbone.model.config.hidden_size,
+                                           l_channels=l_channels, se=se)
 
     def forward(self, x: torch.Tensor) -> BackboneOutput[torch.Tensor]:
         """Process input through both backbones and fuse their features."""
@@ -232,20 +358,33 @@ class LGBackbone(nn.Module):
                 )
         #return {name: feat for name, feat in zip(self.out_features, final_features)}
 
+_SWIN_CONFIGS = {
+    "swin":   ("facebook/mask2former-swin-small-ade-semantic", [96, 192, 384, 768]),
+    "swin-b": ("facebook/mask2former-swin-base-ade-semantic",  [128, 256, 512, 1024]),
+}
+
+_DINOV3_MODELS = {
+    "dinov3-large": ("facebook/dinov3-vitl16-pretrain-lvd1689m", "large"),
+    "dinov3-base":  ("facebook/dinov3-vitb16-pretrain-lvd1689m", "base"),
+    "dinov3-small": ("facebook/dinov3-vits16-pretrain-lvd1689m", "small"),
+}
+
 def create_swin_mask2former(
     label2id: Dict[str, int],
-    id2label: Dict[int, str]
+    id2label: Dict[int, str],
+    l_backbone_type: str = "swin"
 ) -> AutoModelForUniversalSegmentation:
-    """Create a Mask2Former model with Swin-Small backbone (baseline architecture).
-    
+    """Create a Mask2Former model with a Swin backbone (baseline architecture).
+
     Args:
         label2id: Mapping from label names to class indices
         id2label: Mapping from class indices to label names
-    
+        l_backbone_type: Swin variant - "swin" (Swin-Small) or "swin-b" (Swin-Base)
+
     Returns:
-        Initialized Mask2Former model with Swin-Small encoder
+        Initialized Mask2Former model with Swin encoder
     """
-    mask2former_model_name = "facebook/mask2former-swin-small-ade-semantic"
+    mask2former_model_name, _ = _SWIN_CONFIGS[l_backbone_type]
     model = AutoModelForUniversalSegmentation.from_pretrained(
         mask2former_model_name,
         label2id=label2id,
@@ -258,30 +397,36 @@ def create_swin_mask2former(
 def create_lgnet(
     label2id: Dict[str, int],
     id2label: Dict[int, str],
-    dinov3_model_name: str = "facebook/dinov3-vitl16-pretrain-lvd1689m",
+    l_backbone_type: str = "swin",
+    g_backbone_type: str = "dinov3-large",
     se: bool = True,
-    expected_channels: List[int] = [96, 192, 384, 768], # swin small config
     freeze_backbone: bool = True,
     hub_token: str = None
 ) -> AutoModelForUniversalSegmentation:
-    """Create an L+GNet model: Mask2Former with fused Swin (learned) and DINOv3 (general) backbones.
-    
+    """Create an L+GNet model: Mask2Former with fused learned and general backbones.
+
     Args:
         label2id: Mapping from label names to class indices
         id2label: Mapping from class indices to label names
-        dinov3_model_name: HuggingFace model identifier for DINOv3 (vitl/vitb/vits)
+        l_backbone_type: Learned backbone - "swin" (Swin-Small), "swin-b" (Swin-Base), or "mit" (MiT-B3)
+        g_backbone_type: General backbone - "dinov3-large", "dinov3-base", "dinov3-small", or "siglip2"
         se: Whether to use Squeeze-Excitation attention in feature fusion
-        expected_channels: Channel dimensions for each stage [96, 192, 384, 768] for Swin-Small
-        freeze_backbone: Whether to freeze the general backbone (DINOv3) parameters
+        freeze_backbone: Whether to freeze the general backbone parameters
         hub_token: HuggingFace API token for accessing gated models
-    
+
     Returns:
         Initialized L+GNet model with fused learned and general backbones
     """
-    # Fixed Mask2Former base model - using small version
-    mask2former_model_name = "facebook/mask2former-swin-small-ade-semantic"
-    
-    # 1. Load the base Mask2Former model with Swin-Small encoder (learned backbone)
+    # Swin variants determine both the M2F base model and pixel decoder channel config.
+    # MiT reuses the Swin-Small base (pixel decoder stays the same; SE adapter bridges channel mismatch).
+    if l_backbone_type in _SWIN_CONFIGS:
+        mask2former_model_name, expected_channels = _SWIN_CONFIGS[l_backbone_type]
+    elif l_backbone_type == "mit":
+        mask2former_model_name, expected_channels = _SWIN_CONFIGS["swin"]
+    else:
+        raise ValueError(f"Unsupported l_backbone_type: {l_backbone_type}")
+
+    # 1. Load base Mask2Former (pixel decoder + transformer decoder come from here)
     model = AutoModelForUniversalSegmentation.from_pretrained(
         mask2former_model_name,
         label2id=label2id,
@@ -289,28 +434,31 @@ def create_lgnet(
         ignore_mismatched_sizes=True,
         token=hub_token,
     )
-    
-    # 2. Create custom DINOv3 backbone with adapter (general backbone for rich semantic features)
-    # Detect DINOv3 variant size from model name (vitl=large, vitb=base, vits=small)
-    if "vitl" in dinov3_model_name:
-        dinov3_variant = "large"
-    elif "vitb" in dinov3_model_name:
-        dinov3_variant = "base"
-    elif "vits" in dinov3_model_name:
-        dinov3_variant = "small"
-    else:
-        raise ValueError(f"Unsupported dinov3_model_name: {dinov3_model_name}")
-    
-    # Initialize DINOv3 backbone with adapter for feature extraction
-    dinov3_backbone = DinoV3WithAdapterBackbone(dinov3_model_name, expected_channels, standalone=False, dinov3_variant=dinov3_variant)
 
-    # 3. Replace the Mask2Former encoder with L+G backbone that fuses learned and general features
-    model.model.pixel_level_module.encoder = LGBackbone(model.model.pixel_level_module.encoder, dinov3_backbone, expected_channels, se=se)
+    # 2. Build learned backbone
+    if l_backbone_type in _SWIN_CONFIGS:
+        l_backbone = model.model.pixel_level_module.encoder
+    else:
+        l_backbone = MiTBackbone("nvidia/mit-b3")
+
+    # 3. Build general backbone (always frozen)
+    if g_backbone_type in _DINOV3_MODELS:
+        model_name, variant = _DINOV3_MODELS[g_backbone_type]
+        g_backbone = DinoV3WithAdapterBackbone(model_name, expected_channels, standalone=False, dinov3_variant=variant)
+    elif g_backbone_type == "siglip2":
+        g_backbone = SigLIPBackbone("google/siglip2-large-patch16-384")
+    elif g_backbone_type == "pe":
+        g_backbone = PEBackbone("vit_pe_core_large_patch14_336.fb")
+    else:
+        raise ValueError(f"Unsupported g_backbone_type: {g_backbone_type}")
+
+    # 4. Replace encoder with LGBackbone fusing both
+    model.model.pixel_level_module.encoder = LGBackbone(l_backbone, g_backbone, expected_channels, se=se)
 
     # Freeze the general backbone (DINOv3) parameters to leverage pre-trained knowledge without fine-tuning
     for param in model.model.pixel_level_module.encoder.g_backbone.parameters():
         param.requires_grad = False
-    
+
     return model
 
 def create_mask2former_dinov3_model(

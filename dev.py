@@ -52,7 +52,7 @@ from timm.optim import optim_factory
 from torch.cuda.amp import autocast, GradScaler
 from torchvision.transforms import v2 as T
 
-from models.LGNet import create_mask2former_dinov3_model, create_swin_mask2former, create_lgnet
+from models.LGNet import create_mask2former_dinov3_model, create_swin_mask2former, create_lgnet, _DINOV3_MODELS
 
 # Import utility modules for metrics, visualization, and data loading
 from utils.utils import CalibCurve, Metrics, m2foutput_to_prob_masks, Visualizer, compute_pixels_in_dataset
@@ -83,36 +83,28 @@ train_transforms = T.Compose([
     T.RandomVerticalFlip(p=0.1)
 ])
 
-def train(dataset_path: str, model_suffix: str, model_type: str, dinov3_size: str = "large", se: bool = True):
+def train(dataset_path: str, model_suffix: str, model_type: str, se: bool = True,
+          l_backbone: str = "swin", g_backbone: str = "dinov3-large"):
     """
     Train a glass segmentation model.
-    
+
     Args:
         dataset_path: Path to dataset root (should contain train/image and train/mask subdirectories)
         model_suffix: Suffix for the saved model filename
         model_type: Type of model to train - "dinov3", "swin", or "lgnet"
-        dinov3_size: Size of DINOv3 backbone if applicable - "large", "base", or "small"
         se: Whether to use Squeeze-Excitation blocks in L+GNet (only relevant for lgnet type)
+        l_backbone: Learned backbone for lgnet - "swin" or "mit"
+        g_backbone: General backbone - "dinov3-large", "dinov3-base", "dinov3-small", or "siglip2"
     """
-
-    # Map dinov3_size to a model name string (functions detect 'vitl', 'vitb', 'vits')
-    default_dinov3_name = "facebook/dinov3-vitl16-pretrain-lvd1689m"
-    if dinov3_size == "large":
-        dinov3_model_name = default_dinov3_name
-    elif dinov3_size == "base":
-        dinov3_model_name = default_dinov3_name.replace("vitl", "vitb")
-    elif dinov3_size == "small":
-        dinov3_model_name = default_dinov3_name.replace("vitl", "vits")
-    else:
-        raise ValueError(f"Unsupported dinov3_size: {dinov3_size}")
 
     # Select model constructor based on argument
     if model_type == "dinov3":
-        model = create_mask2former_dinov3_model(ID2LABEL, LABEL2ID, dinov3_model_name)
+        model_name, _ = _DINOV3_MODELS[g_backbone]
+        model = create_mask2former_dinov3_model(ID2LABEL, LABEL2ID, model_name)
     elif model_type == "swin":
-        model = create_swin_mask2former(ID2LABEL, LABEL2ID)
+        model = create_swin_mask2former(ID2LABEL, LABEL2ID, l_backbone)
     else:
-        model = create_lgnet(ID2LABEL, LABEL2ID, dinov3_model_name, se=se)
+        model = create_lgnet(ID2LABEL, LABEL2ID, l_backbone_type=l_backbone, g_backbone_type=g_backbone, se=se)
 
     # Initialize training dataset with image/mask pairs and augmentation transforms
     train_dataset = SegmentationDataset(
@@ -159,7 +151,7 @@ def train(dataset_path: str, model_suffix: str, model_type: str, dinov3_size: st
 
     # Training loop
     for epoch in range(num_epochs):
-        print("Epoch:", epoch)
+        epoch_loss = 0.0
         for batch, _, _, _ in train_dataloader:
             optimizer.zero_grad()
             # Move batch data to GPU
@@ -167,7 +159,7 @@ def train(dataset_path: str, model_suffix: str, model_type: str, dinov3_size: st
             batch["pixel_mask"] = batch["pixel_mask"].to("cuda")
             batch["mask_labels"] = [mask_label.to("cuda") for mask_label in batch["mask_labels"]]
             batch["class_labels"] = [class_label.to("cuda") for class_label in batch["class_labels"]]
-            
+
             # Forward pass with automatic mixed precision (fp16)
             with autocast():
                 outputs = model(**batch)
@@ -178,48 +170,42 @@ def train(dataset_path: str, model_suffix: str, model_type: str, dinov3_size: st
             scaler.step(optimizer)
             scaler.update()
             lr_scheduler.step()
-            
-            print("loss:", loss.item())
+
+            epoch_loss += loss.item()
+
+        print(f"Epoch {epoch} loss: {epoch_loss / len(train_dataloader):.4f}")
     
     # Save trained model weights
     filename = dataset_path.split("/")[-1] + model_suffix + ".pth"
     torch.save(model.state_dict(), filename)
     print("Model saved with name:", filename)
 
-def test(dataset_path: str, weights_path: str, model_type: str, dinov3_size: str = "large", se: bool = True, comp_metrics: bool = False, 
-         plot_calib_curve: bool = False, visualize_results: bool = False):
+def test(dataset_path: str, weights_path: str, model_type: str, se: bool = True,
+         comp_metrics: bool = False, plot_calib_curve: bool = False, visualize_results: bool = False,
+         l_backbone: str = "swin", g_backbone: str = "dinov3-large"):
     """
     Evaluate a glass segmentation model on test set.
-    
+
     Args:
         dataset_path: Path to dataset root (should contain test/image and test/mask subdirectories)
         weights_path: Path to saved model weights file
         model_type: Type of model - "dinov3", "swin", or "lgnet"
-        dinov3_size: Size of DINOv3 backbone if applicable - "large", "base", or "small"
         se: Whether to use Squeeze-Excitation blocks in L+GNet (only relevant for lgnet type)
         comp_metrics: Whether to compute and display metrics (IoU, F-beta, MAE, BER)
         plot_calib_curve: Whether to plot calibration curve
         visualize_results: Whether to save visualization overlays and mask predictions
+        l_backbone: Learned backbone for lgnet - "swin" or "mit"
+        g_backbone: General backbone - "dinov3-large", "dinov3-base", "dinov3-small", or "siglip2"
     """
-
-    # Map dinov3_size to a model name string
-    default_dinov3_name = "facebook/dinov3-vitl16-pretrain-lvd1689m"
-    if dinov3_size == "large":
-        dinov3_model_name = default_dinov3_name
-    elif dinov3_size == "base":
-        dinov3_model_name = default_dinov3_name.replace("vitl", "vitb")
-    elif dinov3_size == "small":
-        dinov3_model_name = default_dinov3_name.replace("vitl", "vits")
-    else:
-        raise ValueError(f"Unsupported dinov3_size: {dinov3_size}")
 
     # Select model constructor based on argument
     if model_type == "dinov3":
-        model = create_mask2former_dinov3_model(ID2LABEL, LABEL2ID, dinov3_model_name)
+        model_name, _ = _DINOV3_MODELS[g_backbone]
+        model = create_mask2former_dinov3_model(ID2LABEL, LABEL2ID, model_name)
     elif model_type == "swin":
-        model = create_swin_mask2former(ID2LABEL, LABEL2ID)
+        model = create_swin_mask2former(ID2LABEL, LABEL2ID, l_backbone)
     else:
-        model = create_lgnet(ID2LABEL, LABEL2ID, dinov3_model_name, se=se)
+        model = create_lgnet(ID2LABEL, LABEL2ID, l_backbone_type=l_backbone, g_backbone_type=g_backbone, se=se)
 
     # Load pre-trained weights and prepare model for evaluation
     model.load_state_dict(torch.load(weights_path))
@@ -303,45 +289,38 @@ def test(dataset_path: str, weights_path: str, model_type: str, dinov3_size: str
     print("Tested with saved model:", weights_path)
 
 
-def inference_timing(model_type: str, dinov3_size: str = "large", warmup: int = 200, se: bool = True, half_precision: bool=True):
+def inference_timing(model_type: str, warmup: int = 200, se: bool = True,
+                     half_precision: bool = True, l_backbone: str = "swin", g_backbone: str = "dinov3-large"):
     """
     Benchmark inference speed of a model.
-    
+
     Args:
         model_type: Type of model - "dinov3", "swin", or "lgnet"
-        dinov3_size: Size of DINOv3 backbone if applicable - "large", "base", or "small"
         warmup: Number of warmup iterations before timing (to allow GPU to stabilize)
         se: Whether to use Squeeze-Excitation blocks in L+GNet (only relevant for lgnet type)
         half_precision: Whether to run model in fp16 (half precision floating point)
+        l_backbone: Learned backbone for lgnet - "swin" or "mit"
+        g_backbone: General backbone - "dinov3-large", "dinov3-base", "dinov3-small", or "siglip2"
     """
-
-    # Map dinov3_size to a model name string
-    default_dinov3_name = "facebook/dinov3-vitl16-pretrain-lvd1689m"
-    if dinov3_size == "large":
-        dinov3_model_name = default_dinov3_name
-    elif dinov3_size == "base":
-        dinov3_model_name = default_dinov3_name.replace("vitl", "vitb")
-    elif dinov3_size == "small":
-        dinov3_model_name = default_dinov3_name.replace("vitl", "vits")
-    else:
-        raise ValueError(f"Unsupported dinov3_size: {dinov3_size}")
 
     # Select model constructor based on argument and load with appropriate precision
     if model_type == "dinov3" and half_precision==False:
-        model = create_mask2former_dinov3_model(ID2LABEL, LABEL2ID, dinov3_model_name)
+        model_name, _ = _DINOV3_MODELS[g_backbone]
+        model = create_mask2former_dinov3_model(ID2LABEL, LABEL2ID, model_name)
     elif model_type == "dinov3" and half_precision==True:
         print("###################HALF PRECISION######################")
-        model = create_mask2former_dinov3_model(ID2LABEL, LABEL2ID, dinov3_model_name).half()
+        model_name, _ = _DINOV3_MODELS[g_backbone]
+        model = create_mask2former_dinov3_model(ID2LABEL, LABEL2ID, model_name).half()
     elif model_type == "swin" and half_precision==False:
-        model = create_swin_mask2former(ID2LABEL, LABEL2ID)
+        model = create_swin_mask2former(ID2LABEL, LABEL2ID, l_backbone)
     elif model_type == "swin" and half_precision==True:
         print("###################HALF PRECISION######################")
-        model = create_swin_mask2former(ID2LABEL, LABEL2ID).half()
+        model = create_swin_mask2former(ID2LABEL, LABEL2ID, l_backbone).half()
     elif model_type == "lgnet" and half_precision==False:
-        model = create_lgnet(ID2LABEL, LABEL2ID, dinov3_model_name, se=se)
+        model = create_lgnet(ID2LABEL, LABEL2ID, l_backbone_type=l_backbone, g_backbone_type=g_backbone, se=se)
     elif model_type == "lgnet" and half_precision==True:
         print("###################HALF PRECISION######################")
-        model = create_lgnet(ID2LABEL, LABEL2ID, dinov3_model_name, se=se).half()
+        model = create_lgnet(ID2LABEL, LABEL2ID, l_backbone_type=l_backbone, g_backbone_type=g_backbone, se=se).half()
 
     # Prepare model for evaluation on GPU
     model.eval()
@@ -439,11 +418,21 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--dinov3-size",
+        "--l-backbone",
         type=str,
-        choices=["large", "base", "small"],
-        default="large",
-        help="DINOv3 model size to use when a DINOv3-based model is selected (large, base, small). Default: large"
+        choices=["swin", "swin-b", "mit"],
+        default="swin",
+        dest="l_backbone",
+        help="Learned backbone: swin (Swin-Small), swin-b (Swin-Base), or mit (MiT-B3). Default: swin"
+    )
+
+    parser.add_argument(
+        "--g-backbone",
+        type=str,
+        choices=["dinov3-large", "dinov3-base", "dinov3-small", "siglip2", "pe"],
+        default="dinov3-large",
+        dest="g_backbone",
+        help="General backbone: dinov3-large, dinov3-base, dinov3-small, siglip2, or pe (Meta PE-Core-L14-336). Default: dinov3-large"
     )
 
     parser.add_argument(
@@ -507,10 +496,12 @@ def main():
         print(f"  Dataset: {args.dataset_path}")
         print(f"  Suffix: {args.suffix}")
         print(f"  Model type: {args.model_type}")
-        print(f"  DINOv3 size: {args.dinov3_size}")
         print(f"  SE blocks: {args.se}")
+        print(f"  L backbone: {args.l_backbone}")
+        print(f"  G backbone: {args.g_backbone}")
 
-        train(args.dataset_path, args.suffix, args.model_type, args.dinov3_size, args.se)
+        train(args.dataset_path, args.suffix, args.model_type, args.se,
+              args.l_backbone, args.g_backbone)
 
     # Handle testing mode
     elif args.mode == "test":
@@ -518,8 +509,9 @@ def main():
         print(f"  Dataset: {args.dataset_path}")
         print(f"  Weights: {args.weights_path}")
         print(f"  Model type: {args.model_type}")
-        print(f"  DINOv3 size: {args.dinov3_size}")
         print(f"  SE blocks: {args.se}")
+        print(f"  L backbone: {args.l_backbone}")
+        print(f"  G backbone: {args.g_backbone}")
         print(f"  Compute metrics: {args.metrics}")
         print(f"  Plot calibration curve: {args.calib}")
         print(f"  Visualize results: {args.visualize}")
@@ -528,8 +520,9 @@ def main():
         if not args.weights_path:
             print("ERROR: --weights-path is required for test mode")
             sys.exit(1)
-        test(args.dataset_path, args.weights_path, args.model_type, args.dinov3_size, args.se, args.metrics, args.calib, args.visualize)
-    
+        test(args.dataset_path, args.weights_path, args.model_type, args.se,
+             args.metrics, args.calib, args.visualize, args.l_backbone, args.g_backbone)
+
     # Handle training + testing mode
     elif args.mode == "train_and_test":
         print(f"Running TRAIN + TEST mode")
@@ -537,20 +530,24 @@ def main():
         print(f"  Suffix: {args.suffix}")
         print(f"  Weights: {args.weights_path}")
         print(f"  Model type: {args.model_type}")
-        print(f"  DINOv3 size: {args.dinov3_size}")
         print(f"  SE blocks: {args.se}")
+        print(f"  L backbone: {args.l_backbone}")
+        print(f"  G backbone: {args.g_backbone}")
 
         # First train the model
-        train(args.dataset_path, args.suffix, args.model_type, args.dinov3_size, args.se)
+        train(args.dataset_path, args.suffix, args.model_type, args.se,
+              args.l_backbone, args.g_backbone)
         # Then test if weights path provided, otherwise skip test phase
         if args.weights_path:
-            test(args.dataset_path, args.weights_path, args.model_type, args.dinov3_size, args.se)
+            test(args.dataset_path, args.weights_path, args.model_type, args.se,
+                 l_backbone=args.l_backbone, g_backbone=args.g_backbone)
         else:
             print("WARNING: --weights-path not provided, skipping test phase")
-    
+
     # Handle inference timing benchmark mode
     elif args.mode == "inference_timing":
-        inference_timing(model_type=args.model_type, dinov3_size=args.dinov3_size, se=args.se, half_precision=args.half_precision)
+        inference_timing(model_type=args.model_type, se=args.se,
+                         half_precision=args.half_precision, l_backbone=args.l_backbone, g_backbone=args.g_backbone)
     
     else:
         print(f"Unknown mode: {args.mode}")

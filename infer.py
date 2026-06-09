@@ -34,19 +34,12 @@ def infer(image: Image, weights_path: str, dinov3_size: str = "large"):
     processor = AutoImageProcessor.from_pretrained(m2f_pretrained)
     processor.size = {"height": 512, "width": 512}
 
-    # Map dinov3_size to model name
-    default_dinov3_name = "facebook/dinov3-vitl16-pretrain-lvd1689m"
-    if dinov3_size == "large":
-        dinov3_model_name = default_dinov3_name
-    elif dinov3_size == "base":
-        dinov3_model_name = default_dinov3_name.replace("vitl", "vitb")
-    elif dinov3_size == "small":
-        dinov3_model_name = default_dinov3_name.replace("vitl", "vits")
-    else:
+    _DINOV3_SIZE_MAP = {"large": "dinov3-large", "base": "dinov3-base", "small": "dinov3-small"}
+    if dinov3_size not in _DINOV3_SIZE_MAP:
         raise ValueError(f"Unsupported dinov3_size: {dinov3_size}")
 
     # Create model
-    model = create_lgnet(ID2LABEL, LABEL2ID, dinov3_model_name)
+    model = create_lgnet(ID2LABEL, LABEL2ID, l_backbone_type="swin", g_backbone_type=_DINOV3_SIZE_MAP[dinov3_size])
 
     # Load weights
     model.load_state_dict(torch.load(weights_path, map_location="cuda"))
